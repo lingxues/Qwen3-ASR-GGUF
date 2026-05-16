@@ -54,7 +54,7 @@ class QwenASREngine:
         # 3. 加载识别 LLM
         self.model = llama.LlamaModel(llm_gguf, use_gpu=config.llm_use_gpu)
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=4096, embeddings=False)
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=config.n_ctx * 2, embeddings=False)
 
         # 缓存 Token ID
         self.ID_IM_START = self.model.token_to_id("<|im_start|>")
@@ -82,8 +82,17 @@ class QwenASREngine:
         suffix_tokens = [self.ID_AUDIO_END] + [self.ID_IM_END] + \
                         [self.ID_IM_START] + tk(suffix_head) + [self.ID_ASR_TEXT] + tk(prefix_text)
 
-        # 3. 统计并拼接
+        # 3. 截断音频防止超过 n_ctx
         n_pre, n_aud, n_suf = len(prefix_tokens), audio_embd.shape[0], len(suffix_tokens)
+        max_audio = self.config.n_ctx - n_pre - n_suf - 64  # 预留64token安全空间
+        if max_audio < 100:
+            max_audio = 100  # 至少保留100个音频token
+        if n_aud > max_audio:
+            audio_embd = audio_embd[-max_audio:]
+            n_aud = max_audio
+            print(f"\n[警告] 音频过长，已截断至 {n_aud} tokens")
+        
+        # 4. 统计并拼接
         total_embd = np.zeros((n_pre + n_aud + n_suf, self.model.n_embd), dtype=np.float32)
         
         total_embd[:n_pre] = self.embedding_table[prefix_tokens]
@@ -105,6 +114,11 @@ class QwenASREngine:
         result = DecodeResult()
         
         total_len = full_embd.shape[0]
+        
+        if total_len > self.config.n_ctx:
+            full_embd = full_embd[-self.config.n_ctx:]
+            total_len = self.config.n_ctx
+        
         pos_base = np.arange(0, total_len, dtype=np.int32)
         pos_arr = np.concatenate([pos_base, pos_base, pos_base, np.zeros(total_len, dtype=np.int32)])
         batch = llama.LlamaBatch(max(total_len * 4, 8192), self.model.n_embd, 1)
@@ -148,6 +162,29 @@ class QwenASREngine:
             if len(stable_tokens) > 15:
                 if len(set(stable_tokens[-15:])) <= 3:
                     result.is_aborted = True
+                    break
+            
+            # 熔断检查：检测英文文本重复（连续出现8次相同英文片段，忽略大小写）
+            if stable_text_acc and len(stable_text_acc) > 20:
+                recent_text = stable_text_acc[-300:] if len(stable_text_acc) > 300 else stable_text_acc
+                # 检测1：连续8个相同单词
+                en_pattern = re.findall(r'[a-zA-Z]{3,}', recent_text)
+                if len(en_pattern) >= 8:
+                    last_8 = [w.lower() for w in en_pattern[-8:]]
+                    if len(set(last_8)) == 1:
+                        result.is_aborted = True
+                        break
+                
+                # 检测2：相同英文短语重复3次以上（短语长度10-50字符）
+                recent_lower = recent_text.lower()
+                for plen in range(50, 9, -1):
+                    if len(recent_lower) < plen * 3:
+                        continue
+                    tail = recent_lower[-plen:]
+                    if recent_lower.endswith(tail * 3):
+                        result.is_aborted = True
+                        break
+                if result.is_aborted:
                     break
             
             last_sampled_token = sampler.sample(self.ctx.ptr)

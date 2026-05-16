@@ -229,6 +229,7 @@ class AlignerProcessor:
 class QwenForcedAligner:
     """Qwen3 强制对齐器 (GGUF 后端)"""
     def __init__(self, config: AlignerConfig):
+        self.config = config
         # Split Model Paths
         fe_path = os.path.join(config.model_dir, config.encoder_frontend_fn)
         be_path = os.path.join(config.model_dir, config.encoder_backend_fn)
@@ -249,7 +250,7 @@ class QwenForcedAligner:
         # 2. 加载对齐 LLM
         self.model = llama.LlamaModel(llm_gguf, n_gpu_layers=-1, use_gpu=config.llm_use_gpu)
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=2048, embeddings=False)
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=config.n_ctx * 2, embeddings=False)
         
         self.processor = AlignerProcessor()
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
@@ -297,6 +298,19 @@ class QwenForcedAligner:
 
         # 构建最终全量序列
         n_total = len(pre_ids) + audio_embd.shape[0] + len(post_ids)
+        
+        # 截断防止超过 n_ctx
+        if n_total > self.config.n_ctx:
+            print(f"\n[警告] 对齐序列过长，已截断")
+            max_audio = self.config.n_ctx - len(pre_ids) - len(post_ids) - 64
+            if max_audio < 100:
+                max_audio = 100
+            audio_embd = audio_embd[-max_audio:]
+            n_total = len(pre_ids) + audio_embd.shape[0] + len(post_ids)
+            ts_positions = [p for p in ts_positions if p < n_total]
+            max_words = len(ts_positions) // 2
+            words = words[:max_words]
+        
         full_embd = np.zeros((n_total, self.model.n_embd), dtype=np.float32)
         full_embd[:len(pre_ids)] = self.embedding_table[pre_ids]
         full_embd[len(pre_ids):len(pre_ids)+audio_embd.shape[0]] = audio_embd

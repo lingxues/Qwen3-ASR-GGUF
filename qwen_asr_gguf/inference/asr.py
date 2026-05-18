@@ -232,9 +232,8 @@ class QwenASREngine:
             if not res.is_aborted:
                 break
             temperature += 0.3
-            res.text += "====解码有误，强制熔断===="
             print(f"\n\n[!] 触发重试 (Temp -> {temperature:.1f})\n")
-        return res 
+        return res
 
     def _print_stats(self, stats: dict, audio_duration: float, t_total: float):
         """打印转录过程的性能统计指标"""

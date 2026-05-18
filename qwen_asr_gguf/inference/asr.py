@@ -233,6 +233,23 @@ class QwenASREngine:
                 break
             temperature += 0.3
             print(f"\n\n[!] 触发重试 (Temp -> {temperature:.1f})\n")
+        
+        # 重试用尽后，截断重复内容
+        if res.is_aborted and res.text:
+            # 截断末尾重复的英文短语
+            text_lower = res.text.lower()
+            for plen in range(50, 9, -1):
+                if len(text_lower) < plen * 2:
+                    continue
+                tail = text_lower[-plen:]
+                if text_lower.endswith(tail * 2):
+                    # 找到重复位置，截断到第一次出现
+                    pos = text_lower.rfind(tail, 0, -plen)
+                    if pos >= 0:
+                        res.text = res.text[:pos]
+                        break
+            res.is_aborted = False  # 标记为已处理
+        
         return res
 
     def _print_stats(self, stats: dict, audio_duration: float, t_total: float):

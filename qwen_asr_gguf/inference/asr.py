@@ -186,6 +186,20 @@ class QwenASREngine:
                         break
                 if result.is_aborted:
                     break
+
+            # 熔断检查：检测超长无标点句子（连续生成过长句子而没有断句）
+            if stable_text_acc and len(stable_text_acc) > 60:
+                recent_text = stable_text_acc[-300:] if len(stable_text_acc) > 300 else stable_text_acc
+                # 检查最近60个字符内是否有句子结束标点
+                check_len = min(100, len(recent_text))
+                check_region = recent_text[-check_len:]
+                # 匹配句子结束标点：中文（。！？）和英文（.!?）
+                has_punctuation = re.search(r'[。？！.!?]', check_region)
+                if not has_punctuation:
+                    # 超过60个字符仍无标点，且总长度达到100字符则熔断
+                    if len(stable_text_acc) > 100:
+                        result.is_aborted = True
+                        break
             
             last_sampled_token = sampler.sample(self.ctx.ptr)
             n_gen_tokens += 1
@@ -234,20 +248,40 @@ class QwenASREngine:
             temperature += 0.3
             print(f"\n\n[!] 触发重试 (Temp -> {temperature:.1f})\n")
         
-        # 重试用尽后，截断重复内容
-        if res.is_aborted and res.text:
-            # 截断末尾重复的英文短语
-            text_lower = res.text.lower()
-            for plen in range(50, 9, -1):
-                if len(text_lower) < plen * 2:
-                    continue
-                tail = text_lower[-plen:]
-                if text_lower.endswith(tail * 2):
-                    # 找到重复位置，截断到第一次出现
-                    pos = text_lower.rfind(tail, 0, -plen)
-                    if pos >= 0:
-                        res.text = res.text[:pos]
-                        break
+        # 截断处理：处理重复内容和超长无标点句子
+        if res.text:
+            # 1. 截断末尾重复的英文短语
+            if res.is_aborted:
+                text_lower = res.text.lower()
+                for plen in range(50, 9, -1):
+                    if len(text_lower) < plen * 2:
+                        continue
+                    tail = text_lower[-plen:]
+                    if text_lower.endswith(tail * 2):
+                        # 找到重复位置，截断到第一次出现
+                        pos = text_lower.rfind(tail, 0, -plen)
+                        if pos >= 0:
+                            res.text = res.text[:pos]
+                            break
+
+            # 2. 截断超长无标点句子（在最后一个句子结束标点处截断）
+            if len(res.text) > 60:
+                # 寻找最后一个句子结束标点
+                last_punct = max(
+                    res.text.rfind('。'),
+                    res.text.rfind('！'),
+                    res.text.rfind('？'),
+                    res.text.rfind('.'),
+                    res.text.rfind('!'),
+                    res.text.rfind('?')
+                )
+                # 如果有标点且最后一个标点在50个字符之前，则截断
+                if last_punct > 0 and len(res.text) - last_punct > 50:
+                    res.text = res.text[:last_punct + 1]
+                # 如果完全没有标点且文本超长（>150字符），直接截断到合理长度
+                elif last_punct <= 0 and len(res.text) > 150:
+                    res.text = res.text[:150] + "..."
+
             res.is_aborted = False  # 标记为已处理
         
         return res

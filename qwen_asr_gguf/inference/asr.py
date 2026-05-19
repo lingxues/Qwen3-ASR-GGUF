@@ -249,34 +249,47 @@ class QwenASREngine:
             temperature = min(original_temp + 0.3 * (i + 1), 1.5)
             print(f"\n\n[!] 触发重试 (尝试 {i+1}/3, Temp -> {temperature:.1f})\n")
 
-        # 截断处理：只在 is_aborted 为 True 时处理
+        # 截断处理：只在 is_aborted 为 True 且确实检测到问题时才截断
         if res.is_aborted and res.text:
-            # 1. 截断末尾重复的英文短语
             text_lower = res.text.lower()
-            for plen in range(50, 9, -1):
-                if len(text_lower) < plen * 2:
+            truncated = False
+
+            # 1. 只在检测到明确重复时才截断（至少重复3次）
+            for plen in range(30, 9, -1):
+                if len(text_lower) < plen * 3:
                     continue
                 tail = text_lower[-plen:]
-                if text_lower.endswith(tail * 2):
+                if text_lower.endswith(tail * 3):
                     pos = text_lower.rfind(tail, 0, -plen)
                     if pos >= 0:
                         res.text = res.text[:pos]
+                        truncated = True
                         break
 
-            # 2. 截断超长无标点句子
-            if len(res.text) > 150:
-                last_punct = max(
-                    res.text.rfind('。'),
-                    res.text.rfind('！'),
-                    res.text.rfind('？'),
-                    res.text.rfind('.'),
-                    res.text.rfind('!'),
-                    res.text.rfind('?')
-                )
-                if last_punct > 0 and len(res.text) - last_punct > 50:
-                    res.text = res.text[:last_punct + 1]
-                elif last_punct <= 0:
-                    res.text = res.text[:150] + "..."
+            # 2. 只在完全没有标点且异常长时才截断（>200字符无标点）
+            if not truncated and len(res.text) > 200:
+                has_punct = re.search(r'[。？！.!?]', res.text)
+                if not has_punct:
+                    res.text = res.text[:200] + "..."
+                    truncated = True
+
+            # 如果没有检测到明确问题，保留原始文本（可能只是正常长句）
+            if not truncated:
+                # 检查是否真的有超长无标点段落需要处理
+                if len(res.text) > 100:
+                    last_punct = max(
+                        res.text.rfind('。'),
+                        res.text.rfind('！'),
+                        res.text.rfind('？'),
+                        res.text.rfind('.'),
+                        res.text.rfind('!'),
+                        res.text.rfind('?')
+                    )
+                    # 只有末尾无标点段落超过100字符才截断
+                    if last_punct >= 0 and len(res.text) - last_punct > 100:
+                        res.text = res.text[:last_punct + 1]
+                    elif last_punct < 0 and len(res.text) > 200:
+                        res.text = res.text[:200] + "..."
 
             res.is_aborted = False
 

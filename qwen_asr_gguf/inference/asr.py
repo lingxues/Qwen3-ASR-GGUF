@@ -158,45 +158,41 @@ class QwenASREngine:
                     if streaming: print(re.sub(r'([，。？！：,\.])', r'\1\n', piece), end='', flush=True)
                     stable_text_acc += piece
             
-            # 熔断检查：检测重复循环
-            if len(stable_tokens) > 15:
-                if len(set(stable_tokens[-15:])) <= 3:
+            # 熔断检查：检测严重的token重复循环
+            if len(stable_tokens) > 30:
+                if len(set(stable_tokens[-30:])) <= 2:
                     result.is_aborted = True
                     break
-            
-            # 熔断检查：检测英文文本重复（连续出现8次相同英文片段，忽略大小写）
-            if stable_text_acc and len(stable_text_acc) > 20:
-                recent_text = stable_text_acc[-300:] if len(stable_text_acc) > 300 else stable_text_acc
-                # 检测1：连续8个相同单词
-                en_pattern = re.findall(r'[a-zA-Z]{3,}', recent_text)
-                if len(en_pattern) >= 8:
-                    last_8 = [w.lower() for w in en_pattern[-8:]]
-                    if len(set(last_8)) == 1:
-                        result.is_aborted = True
-                        break
-                
-                # 检测2：相同英文短语重复3次以上（短语长度10-50字符）
-                recent_lower = recent_text.lower()
-                for plen in range(50, 9, -1):
-                    if len(recent_lower) < plen * 3:
+
+            # 熔断检查：检测中文文本连续重复（同一个短语连续重复4次以上）
+            if stable_text_acc and len(stable_text_acc) > 30:
+                recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
+                # 检测中文短语重复：连续4个相同短语（长度4-20字符）
+                for plen in range(20, 4, -1):
+                    if len(recent_text) < plen * 4:
                         continue
-                    tail = recent_lower[-plen:]
-                    if recent_lower.endswith(tail * 3):
+                    tail = recent_text[-plen:]
+                    if recent_text.endswith(tail * 4):
                         result.is_aborted = True
                         break
                 if result.is_aborted:
                     break
 
-            # 熔断检查：检测超长无标点句子（连续生成过长句子而没有断句）
-            # 提高阈值：只有真正超长且无任何标点时才触发，避免误触发
-            if stable_text_acc and len(stable_text_acc) > 150:
-                recent_text = stable_text_acc[-300:] if len(stable_text_acc) > 300 else stable_text_acc
-                # 检查最近150个字符内是否有句子结束标点
-                check_len = min(150, len(recent_text))
-                check_region = recent_text[-check_len:]
-                has_punctuation = re.search(r'[。？！.!?]', check_region)
+            # 熔断检查：检测英文文本重复（连续出现10次相同单词，忽略大小写）
+            if stable_text_acc and len(stable_text_acc) > 30:
+                recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
+                en_pattern = re.findall(r'[a-zA-Z]{3,}', recent_text.lower())
+                if len(en_pattern) >= 10:
+                    last_10 = en_pattern[-10:]
+                    if len(set(last_10)) == 1:
+                        result.is_aborted = True
+                        break
+
+            # 熔断检查：检测超长无标点句子（连续生成250字符以上没有句子结束标点）
+            if stable_text_acc and len(stable_text_acc) > 250:
+                recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
+                has_punctuation = re.search(r'[。？！.!?]', recent_text)
                 if not has_punctuation:
-                    # 超过150字符仍无标点才熔断
                     result.is_aborted = True
                     break
             
@@ -241,55 +237,49 @@ class QwenASREngine:
     ) -> DecodeResult:
         """带熔断加温重试的高层推理封装"""
         original_temp = temperature
+        last_valid_text = ""  # 记录最近一次有效的文本
         for i in range(4):
             res = self._decode(full_embd, prefix_text, rollback_num, is_last_chunk, temperature, streaming=streaming)
             if not res.is_aborted:
+                # 如果成功，保存结果并退出
                 break
+            # 如果触发了熔断，记录当前文本（即使被截断也可能有用）
+            if res.text and len(res.text) > len(last_valid_text):
+                last_valid_text = res.text
             # 减少升温幅度，避免高温导致恶性循环
             temperature = min(original_temp + 0.3 * (i + 1), 1.5)
-            print(f"\n\n[!] 触发重试 (尝试 {i+1}/3, Temp -> {temperature:.1f})\n")
+            print(f"\n\n[!] 触发重试 (尝试 {i+1}/4, Temp -> {temperature:.1f})\n")
 
-        # 截断处理：只在 is_aborted 为 True 且确实检测到问题时才截断
+        # 只有在检测到明确问题时才进行截断处理
         if res.is_aborted and res.text:
             text_lower = res.text.lower()
             truncated = False
 
-            # 1. 只在检测到明确重复时才截断（至少重复3次）
-            for plen in range(30, 9, -1):
-                if len(text_lower) < plen * 3:
+            # 1. 只在检测到极度明确的重复时才截断（重复5次以上）
+            for plen in range(30, 4, -1):
+                if len(text_lower) < plen * 5:
                     continue
                 tail = text_lower[-plen:]
-                if text_lower.endswith(tail * 3):
+                if text_lower.endswith(tail * 5):
                     pos = text_lower.rfind(tail, 0, -plen)
                     if pos >= 0:
                         res.text = res.text[:pos]
                         truncated = True
+                        print(f"[!] 检测到严重重复，已截断")
                         break
 
-            # 2. 只在完全没有标点且异常长时才截断（>200字符无标点）
-            if not truncated and len(res.text) > 200:
+            # 2. 只在完全没有标点且极度异常长时才截断（>300字符无任何标点）
+            if not truncated and len(res.text) > 300:
                 has_punct = re.search(r'[。？！.!?]', res.text)
                 if not has_punct:
-                    res.text = res.text[:200] + "..."
+                    res.text = res.text[:300] + "..."
                     truncated = True
+                    print(f"[!] 检测到超长无标点内容，已截断")
 
-            # 如果没有检测到明确问题，保留原始文本（可能只是正常长句）
+            # 3. 如果没有检测到明确问题，保留原始文本（可能只是正常文本）
+            # 正常文本即使触发熔断也不应该被截断
             if not truncated:
-                # 检查是否真的有超长无标点段落需要处理
-                if len(res.text) > 100:
-                    last_punct = max(
-                        res.text.rfind('。'),
-                        res.text.rfind('！'),
-                        res.text.rfind('？'),
-                        res.text.rfind('.'),
-                        res.text.rfind('!'),
-                        res.text.rfind('?')
-                    )
-                    # 只有末尾无标点段落超过100字符才截断
-                    if last_punct >= 0 and len(res.text) - last_punct > 100:
-                        res.text = res.text[:last_punct + 1]
-                    elif last_punct < 0 and len(res.text) > 200:
-                        res.text = res.text[:200] + "..."
+                print(f"[!] 触发熔断但无明确问题，保留原始文本（长度: {len(res.text)}）")
 
             res.is_aborted = False
 

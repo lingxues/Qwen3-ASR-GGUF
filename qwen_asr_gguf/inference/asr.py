@@ -191,13 +191,13 @@ class QwenASREngine:
                         result.is_aborted = True
                         break
 
-            # 熔断检查：检测超长无标点句子（按标点/换行分割后最长段超过300字符）
+            # 熔断检查：检测超长无标点句子（按标点/换行分割后最长段超过200字符）
             if stable_text_acc and len(stable_text_acc) > 250:
                 recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
                 # 按句子结束标点和换行分割，取最长段落检查
                 segments = re.split(r'[。？！.!?\n]', recent_text)
                 longest_seg = max((s for s in segments if s), key=len, default='')
-                if len(longest_seg) > 300:
+                if len(longest_seg) > 200:
                     result.is_aborted = True
                     break
             
@@ -274,19 +274,19 @@ class QwenASREngine:
                         break
 
             # 2. 超长无标点内容：在自然断点处截断，不加"..."
-            if not truncated and len(res.text) > 300:
+            if not truncated and len(res.text) > 200:
                 has_punct = re.search(r'[。？！.!?]', res.text)
                 if not has_punct:
                     # 找最后一个空格或换行作为截断点
                     break_pos = -1
                     for sep in ('\n', '\r', ' '):
-                        pos = res.text.rfind(sep, 200, min(len(res.text), 350))
+                        pos = res.text.rfind(sep, 100, min(len(res.text), 250))
                         if pos > break_pos:
                             break_pos = pos
-                    if break_pos > 200:
+                    if break_pos > 100:
                         res.text = res.text[:break_pos]
                     else:
-                        res.text = res.text[:300]
+                        res.text = res.text[:200]
                     truncated = True
                     print(f"[!] 检测到超长无标点内容，已截断（{len(res.text)}字符）")
 

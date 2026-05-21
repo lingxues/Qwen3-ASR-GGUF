@@ -164,16 +164,19 @@ class QwenASREngine:
                     result.is_aborted = True
                     break
 
-            # 熔断检查：检测中文文本连续重复（同一个短语连续重复4次以上）
+            # 熔断检查：检测文本连续重复（同一个短语连续重复4次以上）
             if stable_text_acc and len(stable_text_acc) > 30:
                 recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
-                # 检测中文短语重复：连续4个相同短语（长度4-20字符）
-                for plen in range(20, 4, -1):
-                    if len(recent_text) < plen * 4:
-                        continue
-                    tail = recent_text[-plen:]
-                    if recent_text.endswith(tail * 4):
-                        result.is_aborted = True
+                # 分别检查原始文本和去空白文本（防止换行破坏英文句子重复检测）
+                for candidate in (recent_text, re.sub(r'\s', '', recent_text)):
+                    for plen in range(20, 4, -1):
+                        if len(candidate) < plen * 4:
+                            continue
+                        tail = candidate[-plen:]
+                        if candidate.endswith(tail * 4):
+                            result.is_aborted = True
+                            break
+                    if result.is_aborted:
                         break
                 if result.is_aborted:
                     break
@@ -188,11 +191,13 @@ class QwenASREngine:
                         result.is_aborted = True
                         break
 
-            # 熔断检查：检测超长无标点句子（连续生成250字符以上没有句子结束标点）
+            # 熔断检查：检测超长无标点句子（按标点/换行分割后最长段超过300字符）
             if stable_text_acc and len(stable_text_acc) > 250:
                 recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
-                has_punctuation = re.search(r'[。？！.!?]', recent_text)
-                if not has_punctuation:
+                # 按句子结束标点和换行分割，取最长段落检查
+                segments = re.split(r'[。？！.!?\n]', recent_text)
+                longest_seg = max((s for s in segments if s), key=len, default='')
+                if len(longest_seg) > 300:
                     result.is_aborted = True
                     break
             
@@ -237,25 +242,25 @@ class QwenASREngine:
     ) -> DecodeResult:
         """带熔断加温重试的高层推理封装"""
         original_temp = temperature
-        last_valid_text = ""  # 记录最近一次有效的文本
+        best_text = ""  # 记录所有尝试中的最长文本
         for i in range(4):
             res = self._decode(full_embd, prefix_text, rollback_num, is_last_chunk, temperature, streaming=streaming)
             if not res.is_aborted:
-                # 如果成功，保存结果并退出
                 break
-            # 如果触发了熔断，记录当前文本（即使被截断也可能有用）
-            if res.text and len(res.text) > len(last_valid_text):
-                last_valid_text = res.text
-            # 减少升温幅度，避免高温导致恶性循环
+            if res.text and len(res.text) > len(best_text):
+                best_text = res.text
             temperature = min(original_temp + 0.3 * (i + 1), 1.5)
             print(f"\n\n[!] 触发重试 (尝试 {i+1}/4, Temp -> {temperature:.1f})\n")
 
-        # 只有在检测到明确问题时才进行截断处理
+        # 所有重试都失败时，使用最佳文本
+        if res.is_aborted and best_text:
+            res.text = best_text
+
         if res.is_aborted and res.text:
             text_lower = res.text.lower()
             truncated = False
 
-            # 1. 只在检测到极度明确的重复时才截断（重复5次以上）
+            # 1. 检测严重重复并截断（重复5次以上）
             for plen in range(30, 4, -1):
                 if len(text_lower) < plen * 5:
                     continue
@@ -268,16 +273,23 @@ class QwenASREngine:
                         print(f"[!] 检测到严重重复，已截断")
                         break
 
-            # 2. 只在完全没有标点且极度异常长时才截断（>300字符无任何标点）
+            # 2. 超长无标点内容：在自然断点处截断，不加"..."
             if not truncated and len(res.text) > 300:
                 has_punct = re.search(r'[。？！.!?]', res.text)
                 if not has_punct:
-                    res.text = res.text[:300] + "..."
+                    # 找最后一个空格或换行作为截断点
+                    break_pos = -1
+                    for sep in ('\n', '\r', ' '):
+                        pos = res.text.rfind(sep, 200, min(len(res.text), 350))
+                        if pos > break_pos:
+                            break_pos = pos
+                    if break_pos > 200:
+                        res.text = res.text[:break_pos]
+                    else:
+                        res.text = res.text[:300]
                     truncated = True
-                    print(f"[!] 检测到超长无标点内容，已截断")
+                    print(f"[!] 检测到超长无标点内容，已截断（{len(res.text)}字符）")
 
-            # 3. 如果没有检测到明确问题，保留原始文本（可能只是正常文本）
-            # 正常文本即使触发熔断也不应该被截断
             if not truncated:
                 print(f"[!] 触发熔断但无明确问题，保留原始文本（长度: {len(res.text)}）")
 
@@ -387,9 +399,13 @@ class QwenASREngine:
             # 带熔断加温重试的解码调用
             res = self._safe_decode(full_embd, prefix_text, rollback_num, was_last, temperature)
 
-            # 更新记忆与统计
+            # 检测问题文本，跳过记忆防止污染后续分片
+            is_clean = bool(re.search(r'[。？！.!?]', res.text)) or len(res.text) < 100
+            if not is_clean:
+                print(f"[!] 当前分片文本无完整断句，跳过记忆")
+
             all_segments[i].text = res.text
-            asr_memory.append((audio_feature, res.text))
+            asr_memory.append((audio_feature, res.text if is_clean else ""))
             
             total_full_text += res.text
             stats["prefill_tokens"] += res.n_prefill; stats["prefill_time"] += res.t_prefill

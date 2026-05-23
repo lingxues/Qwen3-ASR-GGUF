@@ -299,17 +299,44 @@ class QwenForcedAligner:
         # 构建最终全量序列
         n_total = len(pre_ids) + audio_embd.shape[0] + len(post_ids)
         
-        # 截断防止超过 n_ctx
+        # 截断防止超过 n_ctx（同时截断音频和文本）
         if n_total > self.config.n_ctx:
             print(f"\n[警告] 对齐序列过长，已截断")
-            max_audio = self.config.n_ctx - len(pre_ids) - len(post_ids) - 64
-            if max_audio < 100:
-                max_audio = 100
+            # 1) 优先保留文本：逐个添加单词直到塞满 n_ctx
+            text_base = 1  # ID_AUDIO_END
+            kept_words = []
+            text_used = 0
+            for word in words:
+                wt = tk(word)
+                # pre(1) + text_base + text_used + wt + 2TS + safety
+                if 1 + text_base + text_used + len(wt) + 2 + 64 > self.config.n_ctx:
+                    break
+                text_used += len(wt) + 2
+                kept_words.append(word)
+            # 2) 剩余空间给音频
+            max_audio = self.config.n_ctx - 1 - text_base - text_used - 64
+            if max_audio < 10:
+                max_audio = 10
             audio_embd = audio_embd[-max_audio:]
-            n_total = len(pre_ids) + audio_embd.shape[0] + len(post_ids)
-            ts_positions = [p for p in ts_positions if p < n_total]
-            max_words = len(ts_positions) // 2
-            words = words[:max_words]
+            # 3) 重建 post_ids
+            post_ids = [self.ID_AUDIO_END]
+            for word in kept_words:
+                post_ids.extend(tk(word))
+                post_ids.append(self.ID_TIMESTAMP)
+                post_ids.append(self.ID_TIMESTAMP)
+            # 4) 重建 ts_positions（包含正确的音频长度）
+            prefix_len = len(pre_ids) + max_audio + 1  # pre + audio + ID_AUDIO_END
+            cur = 0
+            ts_positions = []
+            for word in kept_words:
+                wt = tk(word)
+                cur += len(wt)
+                ts_positions.append(prefix_len + cur)
+                cur += 1  # TS1
+                ts_positions.append(prefix_len + cur)
+                cur += 1  # TS2
+            words = kept_words
+            n_total = len(pre_ids) + max_audio + len(post_ids)
         
         full_embd = np.zeros((n_total, self.model.n_embd), dtype=np.float32)
         full_embd[:len(pre_ids)] = self.embedding_table[pre_ids]

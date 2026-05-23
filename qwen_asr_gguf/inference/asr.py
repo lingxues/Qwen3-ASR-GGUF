@@ -164,16 +164,15 @@ class QwenASREngine:
                     result.is_aborted = True
                     break
 
-            # 熔断检查：检测文本连续重复（同一个短语连续重复4次以上）
-            if stable_text_acc and len(stable_text_acc) > 30:
+            # 熔断检查：检测短词/短语严重循环重复（8次以上，只检查2-4字符模式）
+            if stable_text_acc and len(stable_text_acc) >= 16:
                 recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
-                # 分别检查原始文本和去空白文本（防止换行破坏英文句子重复检测）
                 for candidate in (recent_text, re.sub(r'\s', '', recent_text)):
-                    for plen in range(20, 4, -1):
-                        if len(candidate) < plen * 4:
+                    for plen in range(4, 1, -1):
+                        if len(candidate) < plen * 8:
                             continue
                         tail = candidate[-plen:]
-                        if candidate.endswith(tail * 4):
+                        if candidate.endswith(tail * 8):
                             result.is_aborted = True
                             break
                     if result.is_aborted:
@@ -242,60 +241,63 @@ class QwenASREngine:
     ) -> DecodeResult:
         """带熔断加温重试的高层推理封装"""
         original_temp = temperature
-        best_text = ""  # 记录所有尝试中的最长文本
         for i in range(4):
             res = self._decode(full_embd, prefix_text, rollback_num, is_last_chunk, temperature, streaming=streaming)
             if not res.is_aborted:
                 break
-            if res.text and len(res.text) > len(best_text):
-                best_text = res.text
+
+            if res.text:
+                # 尝试清理末尾重复，保留前置内容
+                cleaned = self._remove_tail_repeat(res.text)
+                if cleaned is not None and len(cleaned) >= len(res.text) * 0.3:
+                    res.text = cleaned
+                    res.is_aborted = False
+                    print(f"[!] 末尾重复已清理，保留前置内容（{len(res.text)}字符）")
+                    return res
+
             temperature = min(original_temp + 0.3 * (i + 1), 1.5)
             print(f"\n\n[!] 触发重试 (尝试 {i+1}/4, Temp -> {temperature:.1f})\n")
 
-        # 所有重试都失败时，使用最佳文本
-        if res.is_aborted and best_text:
-            res.text = best_text
-
         if res.is_aborted and res.text:
-            text_lower = res.text.lower()
-            truncated = False
-
-            # 1. 检测严重重复并截断（重复5次以上）
-            for plen in range(30, 4, -1):
-                if len(text_lower) < plen * 5:
-                    continue
-                tail = text_lower[-plen:]
-                if text_lower.endswith(tail * 5):
-                    pos = text_lower.rfind(tail, 0, -plen)
-                    if pos >= 0:
-                        res.text = res.text[:pos]
-                        truncated = True
-                        print(f"[!] 检测到严重重复，已截断")
-                        break
-
-            # 2. 超长无标点内容：在自然断点处截断，不加"..."
-            if not truncated and len(res.text) > 200:
-                has_punct = re.search(r'[。？！.!?]', res.text)
-                if not has_punct:
-                    # 找最后一个空格或换行作为截断点
+            cleaned = self._remove_tail_repeat(res.text)
+            if cleaned is not None:
+                res.text = cleaned
+            else:
+                # 无重复模式可清理，检查是否超长无标点
+                if len(res.text) > 200 and not re.search(r'[。？！.!?]', res.text):
                     break_pos = -1
                     for sep in ('\n', '\r', ' '):
                         pos = res.text.rfind(sep, 100, min(len(res.text), 250))
                         if pos > break_pos:
                             break_pos = pos
-                    if break_pos > 100:
-                        res.text = res.text[:break_pos]
-                    else:
-                        res.text = res.text[:200]
-                    truncated = True
-                    print(f"[!] 检测到超长无标点内容，已截断（{len(res.text)}字符）")
-
-            if not truncated:
-                print(f"[!] 触发熔断但无明确问题，保留原始文本（长度: {len(res.text)}）")
-
+                    res.text = res.text[:break_pos] if break_pos > 100 else res.text[:200]
+                    print(f"[!] 超长无标点内容，已截断（{len(res.text)}字符）")
+                else:
+                    print(f"[!] 触发熔断但无明确问题，保留原始文本（长度: {len(res.text)}）")
             res.is_aborted = False
 
         return res
+
+    def _remove_tail_repeat(self, text):
+        """检测并移除末尾重复（8次以上），返回清理后文本；无重复则返回 None"""
+        if not text or len(text) < 16:
+            return None
+        t = text.lower()
+        for plen in range(30, 1, -1):
+            if len(t) < plen * 8:
+                continue
+            tail = t[-plen:]
+            if t.endswith(tail * 8):
+                pos = t.rfind(tail, 0, -plen)
+                if pos < 0:
+                    return ""
+                # 继续向前扫描同一模式的重复
+                while pos >= plen and t[pos-plen:pos] == tail:
+                    pos -= plen
+                if pos > 0:
+                    return text[:pos]
+                return ""
+        return None
 
     def _print_stats(self, stats: dict, audio_duration: float, t_total: float):
         """打印转录过程的性能统计指标"""

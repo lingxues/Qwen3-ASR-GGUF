@@ -17,6 +17,7 @@ model/*
 
 
 qwen_asr_gguf/inference/bin/*
+qwen_asr_gguf/inference/bin_rocm/*
 !qwen_asr_gguf/inference/bin/llama.cpp放这.txt
 
 # Logs

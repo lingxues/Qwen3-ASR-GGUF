@@ -1,5 +1,7 @@
 # Qwen3-ASR GGUF
 
+**A卡不要用ROCM，比vulkan还慢！！！**
+
 将 [Qwen3-ASR](https://www.modelscope.cn/collections/Qwen/Qwen3-ASR) 模型转换为可本地高效运行的混合格式，实现**快速、准确的离线语音识别**。
 
 主要依赖 [llama.cpp](https://github.com/ggml-org/llama.cpp) 加速 LLM Decoder。
@@ -21,7 +23,44 @@ Qwen3-ASR 0.6B 与 Qwen3-ASR 1.7B 以及 Qwen3-ForceAligner 0.6B 均可用，
 
 ## 性能表现
 
-1.7B 在 RX 7900 XT 上的实测数据（约2小时中文直播音频）：
+**A卡不要用ROCM，比vulkan还慢！！！**
+
+
+1.7B 在 RX 7900 XT (vulkan)上的实测数据（约2小时中文直播音频）：
+
+```
+╭────────────── Qwen3-ASR 配置选项 ───────────────╮
+│  模型目录    D:\ai\Qwen3-ASR-GGUF\model         │
+│  编码精度    fp16                               │
+│  加速设备    ONNX:DML | LLM-GPU:ON | Vulkan:ON  │
+│  时间戳对齐  启用                               │
+│  语言设定    自动识别                           │
+╰─────────────────────────────────────────────────╯
+--- [QwenASR] 初始化引擎 (Provider: DML) ---
+--- [Encoder] 加载 Split ONNX 模型 (Provider: DmlExecutionProvider, Pad: 40s) ---
+    Frontend: qwen3_asr_encoder_frontend.fp16.onnx
+    Backend:  qwen3_asr_encoder_backend.fp16.onnx
+--- [Encoder] 正在预热 (固定形状: 40s)... ---
+--- [Encoder] 预热完成 ---
+--- [QwenASR] 引擎初始化耗时: 4.14 秒 ---
+
+...
+
+📊 性能统计:
+  🔹 RTF (实时率) : 0.022 (越小越快)
+  🔹 音频时长    : 7219.18 秒
+  🔹 总处理耗时  : 158.24 秒
+  🔹 对齐耗时    : 21.526 秒
+  🔹 编码耗时    : 11.835 秒
+  🔹 LLM 预填充  : 17.930 秒 (205694 tokens, 11472.0 tokens/s)
+  🔹 LLM 生成    : 102.702 秒 (15651 tokens, 152.4 tokens/s)
+✅ 已保存文本文件: test.txt
+✅ 已生成字幕文件: test.srt
+✅ 已导出时间戳: test.json
+```
+
+
+1.7B 在 RX 7900 XT (ROCM)上的实测数据（约2小时中文直播音频）：
 
 ```
 HIP Library Path: C:\WINDOWS\SYSTEM32\amdhip64_7.dll

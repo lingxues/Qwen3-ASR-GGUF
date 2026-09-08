@@ -24,6 +24,113 @@ class ASRS_Segment:
     text: str = ""
     items: List[ForcedAlignItem] = None   
 
+def _tail_char_loop(s: str) -> bool:
+    n = len(s)
+    if n < 12:
+        return False
+    tail = s[-400:] if n > 400 else s
+    m = len(tail)
+    for plen in range(1, min(80, m // 2) + 1):
+        if plen <= 4:
+            need = 6
+        elif plen <= 10:
+            need = 4
+        elif plen <= 30:
+            need = 3
+        else:
+            need = 2
+        if m < plen * need:
+            continue
+        pat = tail[-plen:]
+        ok = True
+        for r in range(1, need):
+            if tail[m - (r + 1) * plen: m - r * plen] != pat:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _has_loop_text(text: str) -> bool:
+    if not text:
+        return False
+    if _tail_char_loop(text):
+        return True
+    nospace = re.sub(r'\s', '', text)
+    if nospace is not text and _tail_char_loop(nospace):
+        return True
+    low = text.lower()
+    if _tail_char_loop(low):
+        return True
+    lines = [l.strip() for l in re.split(r'[\n。？！!?；;]+', text) if l.strip()]
+    if len(lines) >= 4:
+        if lines[-1] == lines[-3] and lines[-2] == lines[-4]:
+            return True
+        if lines[-1] == lines[-2] == lines[-3]:
+            return True
+    words = re.findall(r"[a-zA-Z']+", low)
+    if len(words) >= 8:
+        tail = words[-24:] if len(words) > 24 else words
+        tlen = len(tail)
+        for wn in range(1, 7):
+            need = 6 if wn == 1 else 3
+            if tlen < wn * need:
+                continue
+            pat = tail[-wn:]
+            ok = True
+            for r in range(1, need):
+                if tail[tlen - (r + 1) * wn: tlen - r * wn] != pat:
+                    ok = False
+                    break
+            if ok:
+                return True
+    return False
+
+
+def _has_token_loop(toks) -> bool:
+    n = len(toks)
+    if n < 12:
+        return False
+    tail = toks[-60:] if n > 60 else toks
+    m = len(tail)
+    if m >= 20 and len(set(tail[-20:])) == 1:
+        return True
+    for p in range(1, min(24, m // 2) + 1):
+        need = 8 if p == 1 else 4 if p == 2 else 3
+        if m < p * need:
+            continue
+        pat = tail[m - p:]
+        ok = True
+        for r in range(1, need):
+            if tail[m - (r + 1) * p: m - r * p] != pat:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _find_repeat_start(t: str):
+    n = len(t)
+    end = min(100, n // 2)
+    for plen in range(end, 0, -1):
+        need = 2 if plen >= 10 else 3
+        if plen == 1:
+            need = 6
+        if n < plen * need:
+            continue
+        pat = t[n - plen:]
+        cnt = 1
+        pos = n - plen
+        while pos >= plen and t[pos - plen:pos] == pat:
+            cnt += 1
+            pos -= plen
+        if cnt >= need and (plen >= 2 or cnt >= 6):
+            return pos
+    return -1
+
+
 class QwenASREngine:
     """Qwen3-ASR 流式转录引擎 (GGUF 后端) - 统一辅助进程架构"""
     def __init__(self, config: ASREngineConfig):
@@ -158,37 +265,25 @@ class QwenASREngine:
                     if streaming: print(re.sub(r'([，。？！：,\.])', r'\1\n', piece), end='', flush=True)
                     stable_text_acc += piece
             
-            # 熔断检查：检测严重的token重复循环
-            if len(stable_tokens) > 30:
-                if len(set(stable_tokens[-30:])) <= 2:
+            # 熔断检查：token 周期重复（含 display_queue 前视，加速 5 token）
+            if len(stable_tokens) + len(display_queue) >= 12:
+                _all_toks = stable_tokens + list(display_queue) if display_queue else stable_tokens
+                if _has_token_loop(_all_toks):
                     result.is_aborted = True
+                    setattr(result, 'abort_reason', 'loop')
                     break
 
-            # 熔断检查：检测短词/短语严重循环重复（8次以上，只检查2-4字符模式）
-            if stable_text_acc and len(stable_text_acc) >= 16:
-                recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
-                for candidate in (recent_text, re.sub(r'\s', '', recent_text)):
-                    for plen in range(4, 1, -1):
-                        if len(candidate) < plen * 8:
-                            continue
-                        tail = candidate[-plen:]
-                        if candidate.endswith(tail * 8):
-                            result.is_aborted = True
-                            break
-                    if result.is_aborted:
-                        break
-                if result.is_aborted:
+            # 熔断检查：文本周期重复（中英 ABAB / i wish / i will，3 次即熔断）
+            if n_gen_tokens % 2 == 0 and stable_text_acc and len(stable_text_acc) >= 12:
+                try:
+                    _pend_b = b''.join(self.model.token_to_bytes(t) for t in display_queue) if display_queue else b''
+                    _pend_s = _pend_b.decode('utf-8', errors='ignore') if _pend_b else ''
+                except Exception:
+                    _pend_s = ''
+                if _has_loop_text(stable_text_acc + _pend_s):
+                    result.is_aborted = True
+                    setattr(result, 'abort_reason', 'loop')
                     break
-
-            # 熔断检查：检测英文文本重复（连续出现10次相同单词，忽略大小写）
-            if stable_text_acc and len(stable_text_acc) > 30:
-                recent_text = stable_text_acc[-500:] if len(stable_text_acc) > 500 else stable_text_acc
-                en_pattern = re.findall(r'[a-zA-Z]{3,}', recent_text.lower())
-                if len(en_pattern) >= 10:
-                    last_10 = en_pattern[-10:]
-                    if len(set(last_10)) == 1:
-                        result.is_aborted = True
-                        break
 
             # 熔断检查：检测超长无标点句子（按标点/换行分割后最长段超过200字符）
             if stable_text_acc and len(stable_text_acc) > 250:
@@ -198,6 +293,7 @@ class QwenASREngine:
                 longest_seg = max((s for s in segments if s), key=len, default='')
                 if len(longest_seg) > 200:
                     result.is_aborted = True
+                    setattr(result, 'abort_reason', 'long')
                     break
             
             last_sampled_token = sampler.sample(self.ctx.ptr)
@@ -220,6 +316,13 @@ class QwenASREngine:
                 if streaming: print(final_p, end='', flush=True)
                 stable_text_acc += final_p
         
+        if result.is_aborted and display_queue:
+            try:
+                _tail_b = b''.join(self.model.token_to_bytes(t) for t in display_queue)
+                stable_text_acc += _tail_b.decode('utf-8', errors='ignore')
+                stable_tokens.extend(list(display_queue))
+            except Exception:
+                pass
         # 填充结果（内核输出标准化）
         result.text = stable_text_acc
         result.stable_tokens = stable_tokens
@@ -239,64 +342,92 @@ class QwenASREngine:
         temperature: float,
         streaming: bool = True,
     ) -> DecodeResult:
-        """带熔断加温重试的高层推理封装"""
+        """带熔断加温重试的高层推理封装（loop 重试，long 直接截断不重试，省 GPU）"""
         original_temp = temperature
-        for i in range(4):
+        res = None
+        for i in range(3):
             res = self._decode(full_embd, prefix_text, rollback_num, is_last_chunk, temperature, streaming=streaming)
             if not res.is_aborted:
                 break
-
+            reason = getattr(res, 'abort_reason', 'loop')
+            if reason == 'long':
+                res.text = self._truncate_long(res.text)
+                res.is_aborted = False
+                print(f"[!] 超长无标点内容，已截断（{len(res.text)}字符）")
+                return res
             if res.text:
-                # 尝试清理末尾重复，保留前置内容
                 cleaned = self._remove_tail_repeat(res.text)
-                if cleaned is not None and len(cleaned) >= len(res.text) * 0.3:
+                if cleaned is not None and (not res.text or len(cleaned) >= len(res.text) * 0.3):
                     res.text = cleaned
                     res.is_aborted = False
                     print(f"[!] 末尾重复已清理，保留前置内容（{len(res.text)}字符）")
                     return res
+            if i >= 1 and res.text:
+                cleaned = self._remove_tail_repeat(res.text)
+                if cleaned is not None:
+                    res.text = cleaned
+                else:
+                    res.text = self._truncate_long(res.text) if len(res.text) > 200 else res.text
+                res.is_aborted = False
+                return res
+            temperature = min(original_temp + 0.4 * (i + 1), 1.5)
+            print(f"\n\n[!] 触发重试 (尝试 {i+1}/3, Temp -> {temperature:.1f})\n")
 
-            temperature = min(original_temp + 0.3 * (i + 1), 1.5)
-            print(f"\n\n[!] 触发重试 (尝试 {i+1}/4, Temp -> {temperature:.1f})\n")
-
-        if res.is_aborted and res.text:
+        if res is not None and res.is_aborted and res.text:
             cleaned = self._remove_tail_repeat(res.text)
             if cleaned is not None:
                 res.text = cleaned
             else:
-                # 无重复模式可清理，检查是否超长无标点
-                if len(res.text) > 200 and not re.search(r'[。？！.!?]', res.text):
-                    break_pos = -1
-                    for sep in ('\n', '\r', ' '):
-                        pos = res.text.rfind(sep, 100, min(len(res.text), 250))
-                        if pos > break_pos:
-                            break_pos = pos
-                    res.text = res.text[:break_pos] if break_pos > 100 else res.text[:200]
-                    print(f"[!] 超长无标点内容，已截断（{len(res.text)}字符）")
-                else:
-                    print(f"[!] 触发熔断但无明确问题，保留原始文本（长度: {len(res.text)}）")
+                res.text = self._truncate_long(res.text) if len(res.text) > 200 else res.text
             res.is_aborted = False
-
         return res
 
+    def _truncate_long(self, text: str) -> str:
+        if not text or len(text) <= 200:
+            return text
+        if re.search(r'[。？！.!?]', text):
+            return text[:250]
+        break_pos = -1
+        for sep in ('\n', '\r', ' '):
+            pos = text.rfind(sep, 100, min(len(text), 250))
+            if pos > break_pos:
+                break_pos = pos
+        return text[:break_pos] if break_pos > 100 else text[:200]
+
     def _remove_tail_repeat(self, text):
-        """检测并移除末尾重复（8次以上），返回清理后文本；无重复则返回 None"""
-        if not text or len(text) < 16:
+        """检测并移除末尾重复（字符/行/单词级，2-3 次即清理），无重复返回 None"""
+        if not text or len(text) < 12:
             return None
         t = text.lower()
-        for plen in range(30, 1, -1):
-            if len(t) < plen * 8:
-                continue
-            tail = t[-plen:]
-            if t.endswith(tail * 8):
-                pos = t.rfind(tail, 0, -plen)
-                if pos < 0:
-                    return ""
-                # 继续向前扫描同一模式的重复
-                while pos >= plen and t[pos-plen:pos] == tail:
-                    pos -= plen
-                if pos > 0:
-                    return text[:pos]
-                return ""
+        pos = _find_repeat_start(t)
+        if pos > 0:
+            return text[:pos]
+        if pos == 0:
+            return ""
+        lines = [l.strip() for l in re.split(r'[\n。？！!?；;]+', text) if l.strip()]
+        if len(lines) >= 4 and lines[-1] == lines[-3] and lines[-2] == lines[-4]:
+            keep = lines[:-4]
+            head_len = len(text) - len(''.join(lines[-4:]))
+            return text[:max(head_len, 0)].rstrip() if keep else ""
+        if len(lines) >= 3 and lines[-1] == lines[-2] == lines[-3]:
+            idx = text.rfind(lines[-1], 0, len(text) - len(lines[-1]))
+            return text[:idx].rstrip() if idx > 0 else ""
+        words = re.findall(r"[a-zA-Z']+", t)
+        if len(words) >= 9:
+            for wn in range(1, 7):
+                need = 6 if wn == 1 else 3
+                if len(words) < wn * need:
+                    continue
+                pat = words[-wn:]
+                if all(words[len(words) - (r + 1) * wn: len(words) - r * wn] == pat for r in range(1, need)):
+                    cut = len(words) - wn * need
+                    head_words = words[:cut]
+                    if not head_words:
+                        return ""
+                    tail_str = ' '.join(head_words)
+                    if len(text) > len(tail_str):
+                        return text[:text.lower().rfind(pat[0].lower())].rstrip() if cut > 0 else ""
+                    return tail_str
         return None
 
     def _print_stats(self, stats: dict, audio_duration: float, t_total: float):
